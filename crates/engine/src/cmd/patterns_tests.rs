@@ -1733,6 +1733,75 @@ fn copies_of_a_curvature_or_spline_fillet_keep_its_type() {
     }
 }
 
+/// A rib and its round on a solid of revolution, patterned about that solid's axis. Each copy is
+/// the first rib and round turned about the axis: four copies add three times what the one rib
+/// added to the ring.
+#[test]
+fn a_circular_pattern_about_a_revolved_ring_turns_the_rib_and_its_round() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XZ", "name": "Section"}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 40], [-24, 58], [0, 58]], "closed": true}));
+    run(&mut s, "sketch.fillet", json!({"point": "l1.end", "radius": 0.2}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.revolve", json!({"axis": "X", "angle": "360 deg", "body_name": "Ring", "name": "Ring"}));
+    let ring = volume(&mut s);
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Rib sketch"}));
+    run(&mut s, "sketch.line", json!({"points": [[-16, 50], [-28, 50], [-28, 66], [-16, 66]], "closed": true}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(
+        &mut s,
+        "solid.revolve",
+        json!({"sketch": "Rib sketch", "axis": "X", "angle": "7 deg", "direction": "symmetric", "operation": "join", "name": "Rib"}),
+    );
+    run(&mut s, "solid.fillet", json!({"body": "Ring", "radius": 0.75, "name": "Round", "edges": [[-22, 57.9, 3.54]]}));
+    let one = volume(&mut s);
+    run(&mut s, "solid.pattern.circular", json!({"features": ["Rib", "Round"], "axis": "X", "count": 4, "name": "Pattern"}));
+    let four = volume(&mut s);
+    let want = ring + 4.0 * (one - ring);
+    assert!(rel(four, want) < 1e-6, "ring {ring} mm³, one rib {one} mm³, four {four} mm³ (expected {want})");
+}
+
+/// A cut between the patterned rib and its round belongs to the seed only. Copying the rib's
+/// window would put that cut on every copy.
+#[test]
+fn a_cut_between_patterned_features_stays_on_the_seed() {
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"base": [-40, 0, 0], "axis": [1, 0, 0], "radius": 30, "height": 50, "body_name": "Ring"}));
+    let ring = volume(&mut s);
+    run(
+        &mut s,
+        "solid.box",
+        json!({"corner": [-10, 28, -3], "length": 12, "width": 10, "height": 6, "operation": "join", "targets": ["Ring"], "name": "Rib"}),
+    );
+    let ribbed = volume(&mut s);
+    run(&mut s, "solid.cylinder", json!({"base": [-4, 35, -8], "radius": 1, "height": 16, "operation": "cut", "targets": ["Ring"], "name": "Hole"}));
+    let holed = volume(&mut s);
+    run(&mut s, "solid.fillet", json!({"body": "Ring", "edges": [[-4, 38, 3]], "radius": 1, "name": "Round"}));
+    let done = volume(&mut s);
+    run(&mut s, "solid.pattern.circular", json!({"features": ["Rib", "Round"], "axis": "X", "count": 4, "name": "Pattern"}));
+    let four = volume(&mut s);
+    // Four ribs and rounds, and the one hole. The hole is not a patterned feature.
+    let want = ring + 4.0 * (ribbed - ring) + 4.0 * (done - holed) + (holed - ribbed);
+    let copied = ring + 4.0 * (done - ring);
+    assert!(rel(four, want) < 1e-6, "ring {ring}, rib {ribbed}, hole {holed}, round {done}, four {four} (expected {want})");
+    assert!(rel(four, copied) > 1e-5, "the hole was copied onto every rib: {four} mm³, that result would be {copied}");
+}
+
+/// A separate solid that misses the seed and meets a later copy is joined by that copy, as a
+/// join of the rib meets every solid of the component.
+#[test]
+fn a_solid_a_later_copy_meets_is_joined_with_that_copy() {
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"base": [-40, 0, 0], "axis": [1, 0, 0], "radius": 30, "height": 50, "body_name": "Ring"}));
+    run(&mut s, "solid.box", json!({"corner": [-8, -4, 32], "length": 10, "width": 8, "height": 8, "body_name": "Boss", "name": "Boss"}));
+    run(&mut s, "solid.box", json!({"corner": [-10, 28, -3], "length": 12, "width": 10, "height": 6, "operation": "join", "name": "Rib"}));
+    run(&mut s, "solid.fillet", json!({"body": "Ring", "edges": [[-4, 38, 3]], "radius": 1, "name": "Round"}));
+    assert!(s.model.state().bodies.iter().any(|b| b.name == "Boss"));
+    run(&mut s, "solid.pattern.circular", json!({"features": ["Rib", "Round"], "axis": "X", "count": 4, "name": "Pattern"}));
+    let names: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+    assert!(!names.iter().any(|n| n == "Boss"), "the copy that meets the boss left it apart: {names:?}");
+}
+
 /// #16934: a circular pattern of a groove and the fillet that rounds its edges. The fillet's pick
 /// on the groove's top rim sits at the vertex where the groove's seam splits the rim in two, as
 /// near to one half as to the other: copies made from the pick rounded one half or the other as

@@ -123,6 +123,7 @@ pub mod profile;
 pub mod provenance;
 mod record;
 mod repair;
+mod revolution;
 #[cfg(test)]
 mod seam_faces_tests;
 mod sew;
@@ -230,6 +231,7 @@ pub use prism::{PLANAR_FIT_TOL, extrude_planar_regions, planar_regions_boolean};
 pub use prism_curve::{PlanarPiece, PlanarSpline};
 pub use prism_measure::{PrismSection, certified_prism_equivalent, certified_prism_section};
 pub use repair::{Hole, RebuiltFace, RefusedFace, RepairOptions, RepairRefusal, RepairReport, SewnGap, repair};
+pub use revolution::{closed_turn, local_change, turned_about};
 pub use sew::{EdgeSpec, FaceSpec, MAX_CHAIN_POINTS, SurfSpec, sew, sew_touching, sew_touching_traced};
 pub use solidcore_ops::member_turn::{ParallelTurnError, parallel_turn};
 pub use solidcraft_smlib::hold_a_kernel;

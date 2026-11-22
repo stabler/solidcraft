@@ -4406,7 +4406,7 @@ impl Model {
                         let (r, deferred) = kernel::validating(validation, || {
                             IMPORT_HEALS.with(|h| *h.borrow_mut() = self.import_digests.heals(f.id).cloned());
                             let meshes = prepared_meshes.as_ref().filter(|(id, _)| *id == f.id).map(|(_, meshes)| meshes);
-                            let r = eval_feature(doc, &vals, f, &mut next, &mut warning, &mut import_report, &mut repair, heal, meshes);
+                            let r = eval_feature(doc, &vals, f, &mut next, &mut warning, &mut import_report, &mut repair, heal, meshes, &out);
                             IMPORT_HEALS.with(|h| *h.borrow_mut() = None);
                             r
                         });
@@ -10176,20 +10176,7 @@ fn pattern_transforms(doc: &Document, vals: &BTreeMap<String, Value>, st: &Model
             }
         }
         crate::PatternKind::Circular { origin, axis, count: c, angle, alignment, reversed, axis_ref, axis_feature } => {
-            // On an edge or round face: about it as it is now; on a construction axis: where it is;
-            // else through its origin, whose expressions follow the parameters (#10852).
-            let (origin, axis) = match (axis_ref, axis_feature) {
-                (Some(g), _) => crate::construct::model_axis_in(Some(doc), &*construction_state(doc, st, component)?, g, component)?,
-                (None, Some(name)) => construction_axis_in(Some(doc), st, name, component)?,
-                (None, None) => {
-                    let [x, y, z] = origin;
-                    let o = Vec3::new(val(vals, x, Kind::Length)?, val(vals, y, Kind::Length)?, val(vals, z, Kind::Length)?);
-                    if ![o.x, o.y, o.z].iter().all(|c| c.is_finite() && c.abs() < 1e9) {
-                        return Err(DocError::Invalid("the pattern's axis origin is out of range".into()));
-                    }
-                    (o, axis.0)
-                }
-            };
+            let (origin, axis) = circular_axis(doc, vals, st, component, origin, axis, axis_ref, axis_feature)?;
             let n = count(c)?;
             let total = val(vals, angle, Kind::Angle)?;
             let full = (total.abs() - std::f64::consts::TAU).abs() < 1e-9;
@@ -10206,6 +10193,33 @@ fn pattern_transforms(doc: &Document, vals: &BTreeMap<String, Value>, st: &Model
         }
     }
     Ok(out)
+}
+
+/// The line a circular pattern turns about. On an edge or round face: about it as it is now; on
+/// a construction axis: where it is; else through its origin, whose expressions follow the
+/// parameters (#10852).
+fn circular_axis(
+    doc: &Document,
+    vals: &BTreeMap<String, Value>,
+    st: &ModelState,
+    component: u64,
+    origin: &crate::PointExpr,
+    axis: &crate::points::Dir,
+    axis_ref: &Option<crate::construct::GeoRef>,
+    axis_feature: &Option<crate::names::FeatureName>,
+) -> Result<(Vec3, Vec3)> {
+    match (axis_ref, axis_feature) {
+        (Some(g), _) => crate::construct::model_axis_in(Some(doc), &*construction_state(doc, st, component)?, g, component),
+        (None, Some(name)) => construction_axis_in(Some(doc), st, name, component),
+        (None, None) => {
+            let [x, y, z] = origin;
+            let o = Vec3::new(val(vals, x, Kind::Length)?, val(vals, y, Kind::Length)?, val(vals, z, Kind::Length)?);
+            if ![o.x, o.y, o.z].iter().all(|c| c.is_finite() && c.abs() < 1e9) {
+                return Err(DocError::Invalid("the pattern's axis origin is out of range".into()));
+            }
+            Ok((o, axis.0))
+        }
+    }
 }
 
 fn seg_len(s: &kernel::PathSeg) -> f64 {
@@ -10870,6 +10884,381 @@ fn moved_blend(src: &Feature, m: &Mat) -> Feature {
     copy
 }
 
+/// How far past a feature's tool the window around it reaches, so a round on the tool is inside.
+const TURN_MARGIN_MM: f64 = 1.0;
+
+/// A circular pattern about the axis of one closed solid of revolution turns that solid's
+/// modification with the axis. The round is built once. Each later copy is that modification
+/// turned and combined. `Ok(false)` leaves the model as it was and the ordinary replay to run.
+fn place_by_turning(
+    doc: &Document,
+    vals: &BTreeMap<String, Value>,
+    f: &Feature,
+    st: &mut ModelState,
+    features: &[FeatureId],
+    mats: &[Mat],
+    earlier: &[FeatureResult],
+    origin: Vec3,
+    axis: Vec3,
+) -> Result<bool> {
+    // A kernel error while turning is the ordinary replay's to report. Nothing is written until
+    // every copy has been built.
+    match place_turned(doc, vals, f, st, features, mats, earlier, origin, axis) {
+        Ok(placed) => Ok(placed),
+        Err(_) => Ok(false),
+    }
+}
+
+fn turn_no(_why: &str) -> Result<bool> {
+    Ok(false)
+}
+
+fn place_turned(
+    doc: &Document,
+    vals: &BTreeMap<String, Value>,
+    f: &Feature,
+    st: &mut ModelState,
+    features: &[FeatureId],
+    mats: &[Mat],
+    earlier: &[FeatureResult],
+    origin: Vec3,
+    axis: Vec3,
+) -> Result<bool> {
+    if mats.is_empty() || !features.iter().any(|id| doc.feature(id.0).is_some_and(is_round)) {
+        return turn_no("no round");
+    }
+    let Some(before) = state_before(doc, features, earlier) else {
+        return turn_no("no before");
+    };
+    let Some((min, max)) = modification_box(doc, vals, st, features)? else {
+        return turn_no("no box");
+    };
+    // Copies that meet are solved again: the seed's round was built before those copies existed.
+    // A solid feature between the first patterned feature and the pattern is solved again too.
+    if !copies_stay_apart(min, max, mats) {
+        return turn_no("copies meet");
+    }
+    if !pattern_owns_the_span(doc, f, features) {
+        return turn_no("span");
+    }
+    let window = kernel::box_solid(min, max)?;
+    let mut chosen = Vec::new();
+    for prior in &before.bodies {
+        if prior.component == f.component && st.bodies.iter().all(|b| b.name != prior.name) {
+            return turn_no("body deleted");
+        }
+    }
+    for (i, slot) in st.bodies.iter().enumerate() {
+        if slot.component != f.component {
+            continue;
+        }
+        let Some(prior) = before.bodies.iter().find(|b| b.name == slot.name) else {
+            return turn_no("new body");
+        };
+        if slot.envelope {
+            if prior.body.solid_id() != slot.body.solid_id() {
+                return turn_no("envelope changed");
+            }
+            continue;
+        }
+        if prior.body.solid_id() == slot.body.solid_id() {
+            continue;
+        }
+        if !kernel::closed_turn(&prior.body, origin, axis) {
+            return turn_no("not a closed turn");
+        }
+        if !kernel::local_change(&slot.body, &prior.body, origin, axis, min, max) {
+            return turn_no("change outside window");
+        }
+        chosen.push(i);
+    }
+    if chosen.is_empty() {
+        return turn_no("nothing changed");
+    }
+    if !windows_miss_other_solids(st, f.component, &chosen, min, max, mats) {
+        return turn_no("other solid");
+    }
+    let mut plans = Vec::new();
+    for i in chosen {
+        let Some(slot) = st.bodies.get(i) else {
+            return turn_no("missing slot");
+        };
+        let Some(prior) = before.bodies.iter().find(|b| b.name == slot.name) else {
+            return turn_no("missing prior");
+        };
+        let (Some(after_v), Some(before_v)) = (slot.volume(), prior.volume()) else {
+            return turn_no("no volume");
+        };
+        let Some((added, removed)) = turned_delta(&slot.body, &prior.body, &window)? else {
+            return turn_no("no delta");
+        };
+        if !delta_is_the_whole_change(after_v, before_v, added.as_ref(), removed.as_ref())? {
+            return turn_no("volume");
+        }
+        plans.push((i, added, removed));
+    }
+    // Every copy is built aside. A cut that removes the body, or a kernel error, leaves the model
+    // unchanged.
+    let mut built = Vec::with_capacity(plans.len());
+    for (i, added, removed) in &plans {
+        let Some(slot) = st.bodies.get(*i) else {
+            return turn_no("missing while building");
+        };
+        let mut made = Traced::unnamed(slot.body.clone());
+        for m in mats {
+            if let Some(rem) = removed {
+                let tool = match kernel::transform_matrix(rem, *m) {
+                    Ok(body) => Traced::unnamed(body),
+                    Err(_) => return turn_no("transform cut"),
+                };
+                match kernel::boolean(&made.body, &tool.body, kernel::BoolOp::Cut) {
+                    Ok(Some(next)) => made = Traced::step(next, &[&made, &tool]),
+                    _ => return turn_no("cut"),
+                }
+            }
+            if let Some(add) = added {
+                let tool = match kernel::transform_matrix(add, *m) {
+                    Ok(body) => Traced::unnamed(body),
+                    Err(_) => return turn_no("transform union"),
+                };
+                match kernel::boolean(&made.body, &tool.body, kernel::BoolOp::Union) {
+                    Ok(Some(next)) => made = Traced::step(next, &[&made, &tool]),
+                    _ => return turn_no("union"),
+                }
+            }
+        }
+        built.push((*i, made));
+    }
+    if built.iter().any(|(i, _)| st.bodies.get(*i).is_none()) {
+        return turn_no("slot gone");
+    }
+    for (i, made) in built {
+        if let Some(slot) = st.bodies.get_mut(i) {
+            *slot = slot.remade(made);
+        }
+    }
+    Ok(true)
+}
+
+fn is_round(f: &Feature) -> bool {
+    matches!(f.kind, FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. })
+}
+
+/// True when the turned boxes of the seed's modification miss the seed and each other. Touching
+/// counts as meeting: a round that reaches the next copy is solved again.
+fn copies_stay_apart(min: Vec3, max: Vec3, mats: &[Mat]) -> bool {
+    let mut boxes = vec![(min, max)];
+    for m in mats {
+        boxes.push(turned_box(min, max, m));
+    }
+    boxes.iter().enumerate().all(|(i, a)| boxes.iter().skip(i + 1).all(|b| !boxes_meet(*a, *b)))
+}
+
+fn turned_box(min: Vec3, max: Vec3, m: &Mat) -> (Vec3, Vec3) {
+    let mut bounds = None;
+    for x in [min.x, max.x] {
+        for y in [min.y, max.y] {
+            for z in [min.z, max.z] {
+                let p = crate::apply_point(m, Vec3::new(x, y, z));
+                cover(&mut bounds, p, p);
+            }
+        }
+    }
+    bounds.unwrap_or((min, max))
+}
+
+fn boxes_meet(a: (Vec3, Vec3), b: (Vec3, Vec3)) -> bool {
+    let (a0, a1) = a;
+    let (b0, b1) = b;
+    a0.x <= b1.x && b0.x <= a1.x && a0.y <= b1.y && b0.y <= a1.y && a0.z <= b1.z && b0.z <= a1.z
+}
+
+/// Every feature from the first patterned one up to the pattern is patterned, suppressed, or a
+/// sketch or construction feature. A solid in that span meets the seed and not every copy, or a
+/// copy and not the seed.
+fn pattern_owns_the_span(doc: &Document, pattern: &Feature, features: &[FeatureId]) -> bool {
+    let Some(at) = doc.features.iter().position(|g| g.id == pattern.id) else {
+        return false;
+    };
+    let positions: Vec<usize> = features.iter().filter_map(|id| doc.features.iter().position(|g| g.id == id.0)).collect();
+    if positions.len() != features.len() || positions.iter().any(|p| *p >= at) {
+        return false;
+    }
+    let Some(first) = positions.into_iter().min() else {
+        return false;
+    };
+    doc.features[first..at].iter().all(|g| features.iter().any(|id| id.0 == g.id) || g.suppressed || keeps_the_solids(g))
+}
+
+/// No solid of `component` other than `planned` meets the seed window or a turned copy of it.
+/// A join meets every solid of the component, so one the seed missed and a copy meets is solved
+/// again.
+fn windows_miss_other_solids(st: &ModelState, component: u64, planned: &[usize], min: Vec3, max: Vec3, mats: &[Mat]) -> bool {
+    let mut windows = vec![(min, max)];
+    for m in mats {
+        windows.push(turned_box(min, max, m));
+    }
+    for (i, slot) in st.bodies.iter().enumerate() {
+        if slot.component != component || slot.envelope || planned.contains(&i) {
+            continue;
+        }
+        let Ok(bounds) = slot.body.exact_bounds() else {
+            return false;
+        };
+        if windows.iter().any(|window| boxes_meet(*window, (bounds.min, bounds.max))) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A sketch or a construction feature does not change a solid the copies can land on.
+fn keeps_the_solids(f: &Feature) -> bool {
+    matches!(
+        f.kind,
+        FeatureKind::Sketch { .. }
+            | FeatureKind::ConstructionPlane { .. }
+            | FeatureKind::ConstructionAxis { .. }
+            | FeatureKind::ConstructionPoint { .. }
+    )
+}
+
+/// The window holds every change between the two volumes: the added volume minus the removed
+/// volume is their difference. A clipped round fails this and is solved again.
+fn delta_is_the_whole_change(after: f64, before: f64, added: Option<&kernel::Body>, removed: Option<&kernel::Body>) -> Result<bool> {
+    let want = after - before;
+    let add = match added {
+        Some(b) => kernel::measure(b)?.volume,
+        None => 0.0,
+    };
+    let rem = match removed {
+        Some(b) => kernel::measure(b)?.volume,
+        None => 0.0,
+    };
+    let got = add - rem;
+    Ok((got - want).abs() <= 1e-4 * want.abs().max(1.0) + 1e-3)
+}
+
+/// The model as the first of `features` found it.
+fn state_before<'a>(doc: &Document, features: &[FeatureId], earlier: &'a [FeatureResult]) -> Option<&'a ModelState> {
+    let earliest = features.iter().filter_map(|id| doc.features.iter().position(|f| f.id == id.0)).min()?;
+    if earliest == 0 {
+        return None;
+    }
+    earlier.get(earliest - 1).map(|r| r.state.as_ref())
+}
+
+/// The material one seed adds and removes inside `window`. `None` when the window holds none of
+/// either body, or the two pieces are the same solid.
+fn turned_delta(after: &kernel::Body, before: &kernel::Body, window: &kernel::Body) -> Result<Option<(Option<kernel::Body>, Option<kernel::Body>)>> {
+    let Some(local_after) = kernel::boolean(after, window, kernel::BoolOp::Intersect)? else {
+        return Ok(None);
+    };
+    let Some(local_before) = kernel::boolean(before, window, kernel::BoolOp::Intersect)? else {
+        return Ok(None);
+    };
+    let added = kernel::boolean(&local_after, &local_before, kernel::BoolOp::Cut)?;
+    let removed = kernel::boolean(&local_before, &local_after, kernel::BoolOp::Cut)?;
+    if added.is_none() && removed.is_none() {
+        return Ok(None);
+    }
+    Ok(Some((added, removed)))
+}
+
+/// A box around the patterned tools, grown by the largest round so the round is inside it.
+/// `Ok(None)` when a tool cannot be built: the ordinary replay runs instead.
+fn modification_box(doc: &Document, vals: &BTreeMap<String, Value>, st: &ModelState, features: &[FeatureId]) -> Result<Option<(Vec3, Vec3)>> {
+    let mut reach: f64 = 0.0;
+    let mut bounds: Option<(Vec3, Vec3)> = None;
+    for id in features {
+        let Some(src) = doc.feature(id.0) else {
+            return Ok(None);
+        };
+        if is_round(src) {
+            reach = reach.max(round_reach(vals, src)?);
+            continue;
+        }
+        let mut constructor = None;
+        let mut to_body = None;
+        let mut ignored = None;
+        let tools = match feature_tools_with_constructor(doc, vals, src, st, &mut constructor, &mut to_body, &mut ignored) {
+            Ok(tools) => tools,
+            Err(_) => return Ok(None),
+        };
+        if tools.is_empty() {
+            return Ok(None);
+        }
+        for tool in &tools {
+            let box_of = tool.body.exact_bounds()?;
+            cover(&mut bounds, box_of.min, box_of.max);
+        }
+    }
+    if bounds.is_none() {
+        for id in features {
+            let Some(src) = doc.feature(id.0).filter(|s| is_round(s)) else {
+                continue;
+            };
+            let points = st.blend_edges.get(&src.id).cloned().unwrap_or_else(|| match &src.kind {
+                FeatureKind::Fillet { edges, .. } | FeatureKind::Chamfer { edges, .. } => crate::plain(edges),
+                _ => Vec::new(),
+            });
+            for p in points {
+                cover(&mut bounds, p, p);
+            }
+        }
+    }
+    let Some((min, max)) = bounds else {
+        return Ok(None);
+    };
+    let grow = reach + TURN_MARGIN_MM;
+    let pad = Vec3::new(grow, grow, grow);
+    Ok(Some((min - pad, max + pad)))
+}
+
+fn cover(bounds: &mut Option<(Vec3, Vec3)>, min: Vec3, max: Vec3) {
+    *bounds = Some(match *bounds {
+        None => (min, max),
+        Some((a, b)) => (Vec3::new(a.x.min(min.x), a.y.min(min.y), a.z.min(min.z)), Vec3::new(b.x.max(max.x), b.y.max(max.y), b.z.max(max.z))),
+    });
+}
+
+fn round_reach(vals: &BTreeMap<String, Value>, f: &Feature) -> Result<f64> {
+    match &f.kind {
+        FeatureKind::Fillet { radius, edge_radii, style, setbacks, .. } => {
+            let mut reach = val(vals, radius, Kind::Length)?;
+            for edge in edge_radii {
+                reach = reach.max(val(vals, edge, Kind::Length)?);
+            }
+            match style {
+                crate::FilletStyle::Variable { radius2, mid, .. } => {
+                    reach = reach.max(val(vals, radius2, Kind::Length)?);
+                    for (_, radius) in mid {
+                        reach = reach.max(val(vals, radius, Kind::Length)?);
+                    }
+                }
+                crate::FilletStyle::Spline { radii, .. } => {
+                    for radius in radii {
+                        reach = reach.max(val(vals, radius, Kind::Length)?);
+                    }
+                }
+                crate::FilletStyle::Constant | crate::FilletStyle::Chord | crate::FilletStyle::Curvature => {}
+            }
+            for corner in setbacks {
+                reach = reach.max(val(vals, &corner.distance, Kind::Length)?);
+            }
+            Ok(reach)
+        }
+        FeatureKind::Chamfer { distance, distance2, .. } => {
+            let mut reach = val(vals, distance, Kind::Length)?;
+            if let Some(distance2) = distance2 {
+                reach = reach.max(val(vals, distance2, Kind::Length)?);
+            }
+            Ok(reach)
+        }
+        _ => Ok(0.0),
+    }
+}
+
 /// Apply transformed copies of the tools of `features` (patterns, mirrors).
 fn replay(
     doc: &Document,
@@ -10878,6 +11267,8 @@ fn replay(
     st: &mut ModelState,
     features: &[FeatureId],
     mats: &[Mat],
+    earlier: &[FeatureResult],
+    spin: Option<(Vec3, Vec3)>,
     warning: &mut Option<String>,
 ) -> Result<()> {
     if features.is_empty() {
@@ -10899,6 +11290,11 @@ fn replay(
     let at = |id: &FeatureId| doc.features.iter().position(|x| x.id == id.0).unwrap_or(usize::MAX);
     kept.sort_by_key(at);
     kept.dedup();
+    if let Some((origin, axis)) = spin
+        && place_by_turning(doc, vals, f, st, &kept, mats, earlier, origin, axis)?
+    {
+        return Ok(());
+    }
     let (mut missed, mut total) = (0usize, 0usize);
     let plan = copy_plan(doc, vals, st, &kept, mats)?;
     // A source's named faces are looked up in the model as it was before any copy was made: the
@@ -12178,9 +12574,10 @@ fn eval_feature(
     repair: &mut Option<Arc<kernel::RepairReport>>,
     heal: bool,
     prepared_meshes: Option<&PreparedMeshImport>,
+    earlier: &[FeatureResult],
 ) -> Result<()> {
     JOINED_TARGETS.with(|n| n.borrow_mut().clear());
-    let r = eval_feature_kind(doc, vals, f, st, warning, import_report, repair, heal, prepared_meshes);
+    let r = eval_feature_kind(doc, vals, f, st, warning, import_report, repair, heal, prepared_meshes, earlier);
     for note in JOINED_TARGETS.with(|n| std::mem::take(&mut *n.borrow_mut())) {
         append_warning(warning, note);
     }
@@ -12201,6 +12598,7 @@ fn eval_feature_kind(
     repair: &mut Option<Arc<kernel::RepairReport>>,
     heal: bool,
     prepared_meshes: Option<&PreparedMeshImport>,
+    earlier: &[FeatureResult],
 ) -> Result<()> {
     // Its tools meet bodies in other placements where those are shown (#3383).
     let _frames = ToolFrames::install(doc, f, st);
@@ -12845,7 +13243,13 @@ fn eval_feature_kind(
         FeatureKind::Pattern { features, pattern, bodies, placements } => {
             let mats = pattern_transforms(doc, vals, st, f.component, pattern)?;
             if bodies.is_empty() {
-                return replay(doc, vals, f, st, features, &mats, warning);
+                let spin = match pattern {
+                    crate::PatternKind::Circular { origin, axis, axis_ref, axis_feature, .. } => {
+                        Some(circular_axis(doc, vals, st, f.component, origin, axis, axis_ref, axis_feature)?)
+                    }
+                    _ => None,
+                };
+                return replay(doc, vals, f, st, features, &mats, earlier, spin, warning);
             }
             // Bodies: each copy is a new body named after its source. A body that cannot be
             // copied (gone, its placement gone, or its geometry refused by the move) is left out
@@ -12879,7 +13283,7 @@ fn eval_feature_kind(
         FeatureKind::Mirror { features, plane, bodies, combine, placements } => {
             let pl = doc.resolve_plane_in(vals, plane, 0, f.component, Some(st))?;
             if bodies.is_empty() {
-                return replay(doc, vals, f, st, features, &[mirror_matrix(&pl)], warning);
+                return replay(doc, vals, f, st, features, &[mirror_matrix(&pl)], earlier, None, warning);
             }
             let m = mirror_matrix(&pl);
             let mut output = 0;
